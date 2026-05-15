@@ -14,7 +14,66 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-db_connection = {"conn": None, "conn_string": None, "schema": None}
+FIXED_TABLES = ["departments", "employees", "projects"]
+
+FIXED_SCHEMA_CONTEXT = """
+Database domain: employee departments and projects.
+
+Table: departments
+Columns:
+- department_id (integer, primary key)
+- department_name (varchar)
+- location (varchar)
+Sample rows:
+- (1, 'Engineering', 'Mumbai')
+- (2, 'HR', 'Delhi')
+- (3, 'Finance', 'Bangalore')
+- (4, 'Marketing', 'Pune')
+- (5, 'Operations', 'Hyderabad')
+
+Table: employees
+Columns:
+- employee_id (integer, primary key)
+- first_name (varchar)
+- last_name (varchar)
+- email (varchar)
+- salary (numeric)
+- department_id (integer, foreign key to departments.department_id)
+- joining_date (date)
+Sample rows:
+- (1, 'Aman', 'Sharma', 'aman.sharma@gmail.com', 75000, 1, '2022-01-10')
+- (2, 'Priya', 'Verma', 'priya.verma@gmail.com', 68000, 2, '2021-05-14')
+- (3, 'Rahul', 'Mehta', 'rahul.mehta@gmail.com', 82000, 1, '2020-03-18')
+- (4, 'Sneha', 'Kapoor', 'sneha.kapoor@gmail.com', 59000, 3, '2023-07-22')
+
+Table: projects
+Columns:
+- project_id (integer, primary key)
+- project_name (varchar)
+- budget (numeric)
+- employee_id (integer, foreign key to employees.employee_id)
+- start_date (date)
+Sample rows:
+- (1, 'AI Chatbot', 500000, 1, '2024-01-10')
+- (2, 'Payroll System', 250000, 2, '2024-02-15')
+- (3, 'Trading Dashboard', 700000, 3, '2024-03-01')
+- (4, 'Finance Tracker', 300000, 4, '2024-01-25')
+
+Relationships:
+- employees.department_id joins departments.department_id
+- projects.employee_id joins employees.employee_id
+
+Common query meanings:
+- "employee", "staff", "person" usually means rows in employees.
+- "department" means departments.department_name or the departments table.
+- "location", "city", or city names like Mumbai/Delhi/Bangalore/Pune/Hyderabad refer to departments.location.
+- "project" means projects.project_name or the projects table.
+- "salary", "pay", or "compensation" refers to employees.salary.
+- "budget", "project cost", or "project amount" refers to projects.budget.
+- To answer department/location questions about employees or projects, join through the foreign keys above.
+"""
+
+db_connection = {"conn": None, "conn_string": None}
 
 
 class ConnectRequest(BaseModel):
@@ -25,36 +84,6 @@ class QueryRequest(BaseModel):
     question: str
 
 
-def get_schema(conn):
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT table_name, column_name, data_type 
-        FROM information_schema.columns 
-        WHERE table_schema = 'public' 
-        ORDER BY table_name, ordinal_position
-    """)
-    rows = cur.fetchall()
-    schema = {}
-    for table, col, dtype in rows:
-        schema.setdefault(table, []).append(f"{col} ({dtype})")
-    cur.close()
-    return schema
-
-
-def get_sample_rows(conn, table, limit=3):
-    cur = conn.cursor()
-    try:
-        cur.execute(f'SELECT * FROM "{table}" LIMIT {limit}')
-        cols = [desc[0] for desc in cur.description]
-        rows = cur.fetchall()
-        cur.close()
-        return cols, rows
-    except Exception:
-        cur.close()
-        conn.rollback()
-        return [], []
-
-
 @app.post("/connect")
 def connect(req: ConnectRequest):
     try:
@@ -63,12 +92,10 @@ def connect(req: ConnectRequest):
             raise HTTPException(status_code=400, detail="No connection string provided")
         logger.info(f"Attempting database connection to: {conn_str.split('@')[-1] if '@' in conn_str else 'unknown'}")
         conn = psycopg2.connect(conn_str)
-        schema = get_schema(conn)
         db_connection["conn"] = conn
         db_connection["conn_string"] = conn_str
-        db_connection["schema"] = schema
-        logger.info(f"Connected successfully. Found {len(schema)} tables: {list(schema.keys())}")
-        return {"status": "connected", "tables": list(schema.keys())}
+        logger.info(f"Connected successfully. Using fixed schema for tables: {FIXED_TABLES}")
+        return {"status": "connected", "tables": FIXED_TABLES}
     except Exception as e:
         logger.error(f"Connection failed: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -81,22 +108,14 @@ def query(req: QueryRequest):
         raise HTTPException(status_code=400, detail="Not connected to database")
     
     logger.info(f"Received query: {req.question}")
-    
-    # Build schema context with sample rows
-    schema_text = ""
-    for table, cols in db_connection["schema"].items():
-        schema_text += f"\nTable: {table}\nColumns: {', '.join(cols)}\n"
-        sample_cols, sample_rows = get_sample_rows(db_connection["conn"], table)
-        if sample_rows:
-            schema_text += f"Sample data ({', '.join(sample_cols)}): {sample_rows[:2]}\n"
 
-    logger.info("Schema context built, sending to agent...")
+    logger.info("Using fixed schema context, sending to agent...")
     from agent import run_agent
-    result = run_agent(req.question, schema_text, db_connection["conn"])
+    result = run_agent(req.question, FIXED_SCHEMA_CONTEXT, db_connection["conn"])
     logger.info(f"Agent response received. is_db_question={result.get('is_db_question')}")
     return result
 
 
 @app.get("/status")
 def status():
-    return {"connected": db_connection["conn"] is not None, "tables": list(db_connection["schema"].keys()) if db_connection["schema"] else []}
+    return {"connected": db_connection["conn"] is not None, "tables": FIXED_TABLES}
