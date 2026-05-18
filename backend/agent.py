@@ -1,84 +1,72 @@
-import os
-import logging
-import re
+"""
+================================================================================
+  SQL AGENT  —  LangGraph pipeline
+================================================================================
+
+Sections
+--------
+  1. Imports & Logger
+  2. LLM Factory
+  3. Agent State
+  4. Utilities  (JSON extraction, type-safe serialisation, SQL sanitisation)
+  5. Visualization intent detector
+  6. Node: Classifier
+  7. Node: SQL Generator
+  8. Node: Format Answer
+  9. Node: Chart Generator
+ 10. Graph definition
+ 11. Public entry-point  run_agent()
+
+================================================================================
+"""
+
+
+# ── 1. Imports & Logger ──────────────────────────────────────────────────────
+
 import json
+import logging
+import os
+import re
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, TypedDict, Annotated
-from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI
+from typing import Any, TypedDict
+
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
 
 logger = logging.getLogger(__name__)
 
 
-def get_llm():
-    return ChatOpenAI(model="gpt-4o", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
+# ── 2. LLM Factory ───────────────────────────────────────────────────────────
 
+def get_llm() -> ChatOpenAI:
+    return ChatOpenAI(
+        model="gpt-4o",
+        temperature=0,
+        api_key=os.getenv("OPENAI_API_KEY"),
+    )
+
+
+# ── 3. Agent State ───────────────────────────────────────────────────────────
 
 class AgentState(TypedDict):
     question: str
     schema: str
     conversation_context: str
     is_db_question: bool
-    sql: str
+    wants_visualization: bool
+    sql: str                        # may be a JSON array of SQL strings for multi-query
     query_result: str
     answer: str
     error: str
-    wants_visualization: bool
     chart: dict[str, Any] | None
 
 
-QUERY_INTENT_TERMS = {
-    "average", "avg", "total", "sum", "count", "number", "many", "minimum", "maximum",
-    "min", "max", "top", "bottom", "highest", "lowest", "most", "least", "show",
-    "list", "find", "filter", "compare", "group", "grouped", "by", "where", "spent",
-    "amount", "revenue", "sales", "orders", "customers", "users", "transactions"
-}
+# ── 4. Utilities ─────────────────────────────────────────────────────────────
 
-VISUALIZATION_TERMS = {
-    "visualize", "visualise", "visualization", "visualisation", "chart", "graph",
-    "plot", "draw", "show", "display", "bar", "line", "pie", "scatter"
-}
-
-SCHEMA_STOPWORDS = {
-    "table", "columns", "sample", "data", "rows", "row", "integer", "bigint",
-    "numeric", "decimal", "double", "precision", "character", "varying",
-    "varchar", "text", "date", "timestamp", "without", "with", "time", "zone",
-    "boolean", "true", "false", "none", "null", "public"
-}
-
-
-def _tokens(text: str) -> set[str]:
-    compacted = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
-    return {token.lower() for token in re.findall(r"[a-zA-Z][a-zA-Z0-9]*", compacted)}
-
-
-def _schema_terms(schema: str) -> set[str]:
-    terms = _tokens(schema.replace("_", " "))
-    return {term for term in terms if len(term) >= 3 and term not in SCHEMA_STOPWORDS}
-
-
-def _looks_db_related(question: str, schema: str) -> bool:
-    question_terms = _tokens(question.replace("_", " "))
-    schema_matches = question_terms & _schema_terms(schema)
-    intent_matches = question_terms & QUERY_INTENT_TERMS
-
-    if len(schema_matches) >= 2:
-        return True
-    if schema_matches and intent_matches:
-        return True
-    if len(intent_matches) >= 2 and any(term in _schema_terms(schema) for term in {"amount", "spent", "state", "date", "gender", "age"}):
-        return True
-    return False
-
-
-def wants_visualization(question: str) -> bool:
-    question_terms = _tokens(question)
-    return bool(question_terms & VISUALIZATION_TERMS)
-
-
-def _json_safe(value):
+def _json_safe(value: Any) -> Any:
+    """Make a single value JSON-serialisable."""
     if isinstance(value, Decimal):
         return float(value)
     if isinstance(value, (date, datetime)):
@@ -86,226 +74,412 @@ def _json_safe(value):
     return value
 
 
-def _rows_to_records(cols, rows):
+def _rows_to_records(cols: list[str], rows: list[tuple]) -> list[dict[str, Any]]:
     return [
-        {col: _json_safe(value) for col, value in zip(cols, row)}
+        {col: _json_safe(val) for col, val in zip(cols, row)}
         for row in rows
     ]
 
 
 def _extract_json_object(content: str) -> dict[str, Any]:
+    """Pull the first JSON object out of an LLM response, stripping markdown fences."""
     cleaned = content.strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
         cleaned = re.sub(r"```$", "", cleaned).strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
+    start, end = cleaned.find("{"), cleaned.rfind("}")
     if start == -1 or end == -1 or end <= start:
-        raise ValueError("LLM did not return a JSON object")
-    return json.loads(cleaned[start:end + 1])
+        raise ValueError(f"LLM did not return a JSON object. Raw response:\n{content}")
+    return json.loads(cleaned[start : end + 1])
 
+
+def _strip_sql_fence(text: str) -> str:
+    """Remove markdown code fences and leading dialect tags from a SQL string."""
+    text = text.strip().strip("`")
+    text = re.sub(r"^sql\s*\n", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+# ── 5. Visualization Intent Detector ─────────────────────────────────────────
+
+_VIZ_PREFIXES = re.compile(
+    r"^(show\s+me|visualize|visualise)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_visualization(question: str) -> bool:
+    """
+    Return True only when the user explicitly opens the question with
+    'show me …' or 'visualize …' / 'visualise …'.
+    """
+    return bool(_VIZ_PREFIXES.match(question.strip()))
+
+
+# ── 6. Node: Classifier ───────────────────────────────────────────────────────
 
 def classify_question(state: AgentState) -> AgentState:
-    logger.info(f"[Classify] Determining if question is DB-related: '{state['question']}'")
-    if _looks_db_related(state["question"], state["schema"]):
-        state["is_db_question"] = True
-        logger.info("[Classify] Heuristic matched schema/query intent; treating as DB question")
-        return state
+    """
+    Determine whether the question is answerable from the connected database.
+    Delegates entirely to the LLM — no keyword lists.
+    """
+    logger.info("[Classify] question='%s'", state["question"])
 
-    response = get_llm().invoke([
-        SystemMessage(content=f"""You are a forgiving database-question classifier. Given a database schema, sample rows, and a user question, determine if the question is asking for information that could plausibly be answered from the connected database.
+    system = f"""You are a database-question classifier.
 
-Rules:
-- Reply YES if the question asks for counts, totals, averages, filters, rankings, comparisons, grouped results, or row lookups using any table or column in the schema.
-- Reply YES even if a filter value is not visible in the sample rows. Samples are incomplete.
-- Reply YES when the user's words are close synonyms of column names, for example "spent" for an amount/spend column, or a state name for a state/location column.
-- Tolerate typos and missing spaces in the question.
-- Reply YES when the question is a follow-up to a previous database question, even if the current question is short, such as asking to list, name, compare, filter, or explain prior results.
-- Reply NO only for questions that are clearly unrelated to the connected data.
+Given a database schema (with sample rows) and a user question, decide whether
+the question is asking for information that can plausibly be answered by querying
+the connected database.
+
+Guidelines
+- Answer YES for any question about counts, totals, averages, filters, rankings,
+  comparisons, grouped results, or individual row lookups that map to the schema.
+- Answer YES for follow-up questions that build on a previous database answer,
+  even when the wording is short or informal.
+- Answer YES when the user's phrasing is a natural-language synonym of a column
+  or table name (e.g. "how much was spent" → an amount/spend column).
+- Answer NO only when the question is clearly unrelated to the connected data.
 
 Schema:
-{state['schema']}
+{state["schema"]}
 
-Recent conversation context:
-{state['conversation_context'] or 'No previous context.'}
+Recent conversation:
+{state["conversation_context"] or "None"}
 
-Reply ONLY with "YES" or "NO"."""),
-        HumanMessage(content=state["question"])
+Reply with exactly one word: YES or NO."""
+
+    response = get_llm().invoke([
+        SystemMessage(content=system),
+        HumanMessage(content=state["question"]),
     ])
-    state["is_db_question"] = response.content.strip().upper() == "YES"
-    logger.info(f"[Classify] Result: is_db_question={state['is_db_question']}")
+    decision = response.content.strip().upper()
+    state["is_db_question"] = decision == "YES"
+    logger.info("[Classify] is_db_question=%s", state["is_db_question"])
     return state
 
+
+# ── 7. Node: SQL Generator ────────────────────────────────────────────────────
 
 def generate_sql(state: AgentState) -> AgentState:
-    logger.info(f"[Generate SQL] Converting question to SQL...")
-    response = get_llm().invoke([
-        SystemMessage(content=f"""You are a PostgreSQL expert. Convert the user question to a valid PostgreSQL query.
+    """
+    Convert the user question into one or more PostgreSQL SELECT statements.
 
-Rules:
-- Use only tables and columns from the schema.
-- Quote identifiers with double quotes.
-- Infer likely column matches from natural language. For example, "spent" can map to an amount/spend column, and a state name can map to a state/location column.
-- Filter text values case-insensitively with ILIKE when the exact capitalization is uncertain.
-- Resolve short follow-up questions using the recent conversation context. For example, pronouns like "them", "those", "it", "that department", or "name them" should refer to the most relevant previous database question/result.
-- Return a single SELECT query only.
+    The LLM decides whether a single query suffices or whether multiple
+    independent queries are needed (e.g. the question spans unrelated
+    aggregations that are cleaner as separate statements).
+
+    Output stored in state["sql"]:
+      - single query  → plain SQL string
+      - multiple      → JSON array of SQL strings, e.g. ["SELECT …", "SELECT …"]
+    """
+    logger.info("[SQL Generator] Generating SQL for: '%s'", state["question"])
+
+    system = f"""You are an expert PostgreSQL query writer.
+
+Your job is to convert the user's natural-language question into correct,
+efficient PostgreSQL SELECT statement(s).
+
+Core rules
+- Use ONLY the tables and columns that appear in the schema below.
+- Always double-quote identifiers (table names, column names).
+- Match text values case-insensitively with ILIKE when the exact casing is uncertain.
+- For date/time filtering, use appropriate PostgreSQL date functions
+  (DATE_TRUNC, EXTRACT, TO_DATE, etc.).
+- Resolve pronouns and references ("them", "those", "the same period", etc.)
+  using the recent conversation context.
+- Never add LIMIT unless the user explicitly asks for a "top N" result.
+- Never use CTEs unless the logic genuinely requires intermediate results.
+
+Single vs. multiple queries
+- If the question can be fully answered by one SELECT, return just that SQL string.
+- If the question requires truly independent aggregations (e.g. "compare Q1 and
+  Q2 sales by region"), return a JSON array of SQL strings so that each can be
+  executed separately and their results merged for the answer.
+  Example of multi-query output:
+      ["SELECT ...", "SELECT ..."]
+
+Output format
+- Single query  → raw SQL only, no markdown, no explanation.
+- Multiple queries → valid JSON array of SQL strings, no markdown, no explanation.
 
 Schema:
-{state['schema']}
+{state["schema"]}
 
-Recent conversation context:
-{state['conversation_context'] or 'No previous context.'}
+Recent conversation:
+{state["conversation_context"] or "None"}"""
 
-Return ONLY the SQL query, no explanation, no markdown."""),
-        HumanMessage(content=state["question"])
+    response = get_llm().invoke([
+        SystemMessage(content=system),
+        HumanMessage(content=state["question"]),
     ])
-    state["sql"] = response.content.strip().strip("`").replace("sql\n", "").strip()
-    logger.info(f"[Generate SQL] Generated: {state['sql']}")
+
+    raw = _strip_sql_fence(response.content)
+
+    # Detect multi-query JSON array
+    if raw.lstrip().startswith("["):
+        try:
+            queries = json.loads(raw)
+            if isinstance(queries, list) and all(isinstance(q, str) for q in queries):
+                state["sql"] = json.dumps(queries)
+                logger.info("[SQL Generator] Multi-query (%d statements)", len(queries))
+                return state
+        except json.JSONDecodeError:
+            pass  # fall through to single-query path
+
+    state["sql"] = raw
+    logger.info("[SQL Generator] Single query: %s", state["sql"])
     return state
 
 
-def execute_sql(state: AgentState) -> AgentState:
-    # This is handled externally; placeholder
-    return state
-
+# ── 8. Node: Format Answer ────────────────────────────────────────────────────
 
 def format_answer(state: AgentState) -> AgentState:
-    logger.info(f"[Format] Converting query results to natural language...")
+    """Convert raw query result(s) into a clear, natural-language answer."""
+    logger.info("[Format Answer] Formatting response")
+
     response = get_llm().invoke([
-        SystemMessage(content="Convert the following SQL query result into a clear, natural English answer. Be concise and helpful."),
-        HumanMessage(content=f"Recent context: {state['conversation_context'] or 'No previous context.'}\nQuestion: {state['question']}\nSQL: {state['sql']}\nResult: {state['query_result']}")
+        SystemMessage(content=(
+            "Convert the SQL query result(s) into a concise, natural English answer. "
+            "If multiple result sets are present, synthesise them into one coherent response."
+        )),
+        HumanMessage(content=(
+            f"Conversation context: {state['conversation_context'] or 'None'}\n"
+            f"Question: {state['question']}\n"
+            f"SQL: {state['sql']}\n"
+            f"Result: {state['query_result']}"
+        )),
     ])
     state["answer"] = response.content.strip()
-    logger.info(f"[Format] Answer generated successfully")
+    logger.info("[Format Answer] Done")
     return state
 
 
-def generate_chart(state: AgentState, records: list[dict[str, Any]], columns: list[str]) -> AgentState:
-    logger.info("[Visualize] Choosing chart type and building chart spec...")
-    response = get_llm().invoke([
-        SystemMessage(content=f"""You are a data visualization assistant for a business chatbot.
-Choose the best chart for the user's question and SQL result.
+# ── 9. Node: Chart Generator ──────────────────────────────────────────────────
 
-Allowed chart types:
-- bar: comparing categories or rankings
-- line: trends over dates/time or ordered sequences
-- scatter: numeric relationships
-- pie: parts of a whole with a small number of categories
+def generate_chart(
+    state: AgentState,
+    records: list[dict[str, Any]],
+    columns: list[str],
+) -> AgentState:
+    """
+    Choose an appropriate chart type and build a chart spec from the query result.
+    The LLM selects chart type, axes, and writes a two-sentence business insight.
+    """
+    logger.info("[Chart Generator] Building chart spec")
+
+    system = f"""You are a data-visualization assistant.
+
+Given a SQL result, choose the most informative chart and return a JSON spec.
+
+Allowed chart types: bar | line | scatter | pie
 
 Return ONLY valid JSON with this exact shape:
 {{
   "type": "bar | line | scatter | pie",
-  "title": "short chart title",
-  "xLabel": "clear x-axis label",
-  "yLabel": "clear y-axis label",
-  "x": ["category/date values"],
-  "y": [number values],
+  "title": "short descriptive title",
+  "xLabel": "x-axis label",
+  "yLabel": "y-axis label",
+  "x": ["category or date values"],
+  "y": [numeric values],
   "seriesName": "legend label",
-  "insight": "two concise sentences: first state the key finding with numbers, then explain the business implication"
+  "insight": "Two sentences: the first states the key finding with specific numbers; the second explains the business implication."
 }}
 
-Rules:
-- Use the provided SQL result only.
-- Prefer bar charts for department/project/employee comparisons.
-- Prefer line charts for date/time trends.
-- Keep labels human readable.
-- If there are too many rows, use the most relevant top 12.
-- y must be numeric.
-- Write the insight as exactly two concise sentences.
-- The first sentence should describe the strongest finding using actual values from the chart.
-- The second sentence should explain what that means for a business user.
-- Do not include SQL or markdown.
+Rules
+- y values must be numeric.
+- Cap at the 12 most relevant rows if there are more.
+- No markdown, no SQL, no extra keys.
 
 Schema:
-{state['schema']}
+{state["schema"]}
 
-Recent conversation context:
-{state['conversation_context'] or 'No previous context.'}"""),
-        HumanMessage(content=json.dumps({
-            "question": state["question"],
-            "columns": columns,
-            "rows": records[:50],
-        }, ensure_ascii=False))
+Conversation context:
+{state["conversation_context"] or "None"}"""
+
+    payload = {
+        "question": state["question"],
+        "columns": columns,
+        "rows": records[:50],
+    }
+
+    response = get_llm().invoke([
+        SystemMessage(content=system),
+        HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
     ])
+
     chart = _extract_json_object(response.content)
     chart.setdefault("seriesName", "Value")
     chart.setdefault("insight", "")
+
     state["chart"] = chart
-    state["answer"] = chart.get("insight") or "Here is the visualization for your data."
-    logger.info(f"[Visualize] Chart generated: {chart.get('type')}")
+    state["answer"] = chart["insight"] or "Here is the visualization for your data."
+    logger.info("[Chart Generator] Chart type: %s", chart.get("type"))
     return state
 
 
-def route_question(state: AgentState):
+# ── 10. Graph Definition ──────────────────────────────────────────────────────
+
+def _route_after_classify(state: AgentState) -> str:
     return "generate_sql" if state["is_db_question"] else END
 
 
-# Build graph
 workflow = StateGraph(AgentState)
 workflow.add_node("classify", classify_question)
 workflow.add_node("generate_sql", generate_sql)
 workflow.add_node("format_answer", format_answer)
 
 workflow.set_entry_point("classify")
-workflow.add_conditional_edges("classify", route_question, {"generate_sql": "generate_sql", END: END})
+workflow.add_conditional_edges(
+    "classify",
+    _route_after_classify,
+    {"generate_sql": "generate_sql", END: END},
+)
 workflow.add_edge("generate_sql", "format_answer")
 workflow.add_edge("format_answer", END)
 
 graph = workflow.compile()
 
 
-def run_agent(question: str, schema: str, conn, conversation_context: str = ""):
-    logger.info(f"[Agent] Starting pipeline for: '{question}'")
-    initial_state: AgentState = {
+# ── 11. Public Entry-point ────────────────────────────────────────────────────
+
+def _execute_queries(
+    sql_value: str,
+    conn,
+) -> tuple[str, list[dict[str, Any]], list[str]]:
+    """
+    Execute one or more SQL statements against *conn*.
+
+    Returns
+    -------
+    result_str : str
+        Human-readable summary of all result sets (passed to the LLM).
+    all_records : list[dict]
+        Merged records from all result sets (used for chart generation).
+    all_cols : list[str]
+        Column names from the last result set.
+    """
+    # Detect multi-query payload
+    queries: list[str]
+    if sql_value.lstrip().startswith("["):
+        try:
+            queries = json.loads(sql_value)
+        except json.JSONDecodeError:
+            queries = [sql_value]
+    else:
+        queries = [sql_value]
+
+    result_parts: list[str] = []
+    all_records: list[dict[str, Any]] = []
+    all_cols: list[str] = []
+
+    cur = conn.cursor()
+    try:
+        for idx, sql in enumerate(queries, start=1):
+            logger.info("[Execute SQL] Query %d/%d: %s", idx, len(queries), sql)
+            cur.execute(sql)
+            cols = [desc[0] for desc in cur.description]
+            rows = cur.fetchall()
+            records = _rows_to_records(cols, rows)
+
+            label = f"Query {idx}" if len(queries) > 1 else "Query"
+            result_parts.append(
+                f"{label}\nColumns: {cols}\nRows: {rows[:50]}"
+            )
+            all_records.extend(records)
+            all_cols = cols
+            logger.info("[Execute SQL] Query %d returned %d rows", idx, len(rows))
+    finally:
+        cur.close()
+
+    return "\n\n".join(result_parts), all_records, all_cols
+
+
+def run_agent(
+    question: str,
+    schema: str,
+    conn,
+    conversation_context: str = "",
+) -> dict[str, Any]:
+    """
+    Main entry-point.
+
+    Parameters
+    ----------
+    question             : user's natural-language question
+    schema               : database schema (DDL + sample rows)
+    conn                 : active psycopg2 (or compatible) connection
+    conversation_context : recent chat history for follow-up resolution
+
+    Returns
+    -------
+    dict with keys: answer, sql (optional), chart (optional),
+                    is_db_question, error (optional)
+    """
+    logger.info("[Agent] Starting pipeline — question='%s'", question)
+
+    state: AgentState = {
         "question": question,
         "schema": schema,
         "conversation_context": conversation_context,
         "is_db_question": False,
+        "wants_visualization": _wants_visualization(question),
         "sql": "",
         "query_result": "",
         "answer": "",
         "error": "",
-        "wants_visualization": wants_visualization(question),
-        "chart": None
+        "chart": None,
     }
 
-    state = initial_state.copy()
-    
-    # Classify
+    # ── Classify ──────────────────────────────────────────────────────────────
     state = classify_question(state)
-    
-    if not state["is_db_question"]:
-        logger.info("[Agent] Not a DB question, returning early")
-        return {"answer": "This question doesn't appear to be related to the connected database. Please ask a question about your data.", "is_db_question": False}
 
-    # Generate SQL
+    if not state["is_db_question"]:
+        logger.info("[Agent] Not a DB question — returning early")
+        return {
+            "answer": (
+                "This question doesn't appear to be related to the connected database. "
+                "Please ask a question about your data."
+            ),
+            "is_db_question": False,
+        }
+
+    # ── Generate SQL ──────────────────────────────────────────────────────────
     state = generate_sql(state)
 
-    # Execute SQL against actual connection
+    # ── Execute SQL ───────────────────────────────────────────────────────────
     try:
-        logger.info(f"[Execute SQL] Running query against database...")
-        cur = conn.cursor()
-        cur.execute(state["sql"])
-        cols = [desc[0] for desc in cur.description]
-        rows = cur.fetchall()
-        cur.close()
-        records = _rows_to_records(cols, rows)
-        result_str = f"Columns: {cols}\nRows: {rows[:50]}"
+        result_str, all_records, all_cols = _execute_queries(state["sql"], conn)
         state["query_result"] = result_str
-        logger.info(f"[Execute SQL] Success. Returned {len(rows)} rows")
-    except Exception as e:
+    except Exception as exc:
         conn.rollback()
-        logger.error(f"[Execute SQL] Failed: {str(e)}")
-        return {"answer": f"SQL execution error: {str(e)}", "sql": state["sql"], "is_db_question": True, "error": True}
+        logger.error("[Execute SQL] Failed: %s", exc)
+        return {
+            "answer": f"SQL execution error: {exc}",
+            "sql": state["sql"],
+            "is_db_question": True,
+            "error": True,
+        }
 
+    # ── Visualization path ────────────────────────────────────────────────────
     if state["wants_visualization"]:
-        if not rows:
-            return {"answer": "I could not build a chart because the query returned no rows.", "is_db_question": True}
-        state = generate_chart(state, records, cols)
+        if not all_records:
+            return {
+                "answer": "The query returned no rows — nothing to visualize.",
+                "is_db_question": True,
+            }
+        state = generate_chart(state, all_records, all_cols)
         logger.info("[Agent] Visualization pipeline complete")
-        return {"answer": state["answer"], "chart": state["chart"], "is_db_question": True}
+        return {
+            "answer": state["answer"],
+            "chart": state["chart"],
+            "is_db_question": True,
+        }
 
+    # ── Text answer path ──────────────────────────────────────────────────────
     state = format_answer(state)
-
     logger.info("[Agent] Pipeline complete")
-    return {"answer": state["answer"], "sql": state["sql"], "is_db_question": True}
+    return {
+        "answer": state["answer"],
+        "sql": state["sql"],
+        "is_db_question": True,
+    }
