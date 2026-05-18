@@ -1,10 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import psycopg2
 import os
 import logging
+from typing import Literal
 
 load_dotenv()
 
@@ -80,8 +81,37 @@ class ConnectRequest(BaseModel):
     connection_string: str = None
 
 
+class ChatMessage(BaseModel):
+    role: Literal["user", "bot", "assistant"]
+    content: str
+
+
 class QueryRequest(BaseModel):
     question: str
+    history: list[ChatMessage] = Field(default_factory=list)
+
+
+def build_conversation_context(history: list[ChatMessage], max_user_turns: int = 3) -> str:
+    if not history:
+        return ""
+
+    selected = []
+    user_turns = 0
+    for message in reversed(history):
+        if not message.content.strip():
+            continue
+        selected.append(message)
+        if message.role == "user":
+            user_turns += 1
+        if user_turns >= max_user_turns:
+            break
+
+    lines = []
+    for message in reversed(selected):
+        role = "User" if message.role == "user" else "Assistant"
+        content = " ".join(message.content.split())
+        lines.append(f"{role}: {content[:700]}")
+    return "\n".join(lines)
 
 
 @app.post("/connect")
@@ -108,10 +138,11 @@ def query(req: QueryRequest):
         raise HTTPException(status_code=400, detail="Not connected to database")
     
     logger.info(f"Received query: {req.question}")
+    conversation_context = build_conversation_context(req.history)
 
     logger.info("Using fixed schema context, sending to agent...")
     from agent import run_agent
-    result = run_agent(req.question, FIXED_SCHEMA_CONTEXT, db_connection["conn"])
+    result = run_agent(req.question, FIXED_SCHEMA_CONTEXT, db_connection["conn"], conversation_context)
     logger.info(f"Agent response received. is_db_question={result.get('is_db_question')}")
     return result
 

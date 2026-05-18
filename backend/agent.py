@@ -19,6 +19,7 @@ def get_llm():
 class AgentState(TypedDict):
     question: str
     schema: str
+    conversation_context: str
     is_db_question: bool
     sql: str
     query_result: str
@@ -119,10 +120,14 @@ Rules:
 - Reply YES even if a filter value is not visible in the sample rows. Samples are incomplete.
 - Reply YES when the user's words are close synonyms of column names, for example "spent" for an amount/spend column, or a state name for a state/location column.
 - Tolerate typos and missing spaces in the question.
+- Reply YES when the question is a follow-up to a previous database question, even if the current question is short, such as asking to list, name, compare, filter, or explain prior results.
 - Reply NO only for questions that are clearly unrelated to the connected data.
 
 Schema:
 {state['schema']}
+
+Recent conversation context:
+{state['conversation_context'] or 'No previous context.'}
 
 Reply ONLY with "YES" or "NO"."""),
         HumanMessage(content=state["question"])
@@ -142,10 +147,14 @@ Rules:
 - Quote identifiers with double quotes.
 - Infer likely column matches from natural language. For example, "spent" can map to an amount/spend column, and a state name can map to a state/location column.
 - Filter text values case-insensitively with ILIKE when the exact capitalization is uncertain.
+- Resolve short follow-up questions using the recent conversation context. For example, pronouns like "them", "those", "it", "that department", or "name them" should refer to the most relevant previous database question/result.
 - Return a single SELECT query only.
 
 Schema:
 {state['schema']}
+
+Recent conversation context:
+{state['conversation_context'] or 'No previous context.'}
 
 Return ONLY the SQL query, no explanation, no markdown."""),
         HumanMessage(content=state["question"])
@@ -164,7 +173,7 @@ def format_answer(state: AgentState) -> AgentState:
     logger.info(f"[Format] Converting query results to natural language...")
     response = get_llm().invoke([
         SystemMessage(content="Convert the following SQL query result into a clear, natural English answer. Be concise and helpful."),
-        HumanMessage(content=f"Question: {state['question']}\nSQL: {state['sql']}\nResult: {state['query_result']}")
+        HumanMessage(content=f"Recent context: {state['conversation_context'] or 'No previous context.'}\nQuestion: {state['question']}\nSQL: {state['sql']}\nResult: {state['query_result']}")
     ])
     state["answer"] = response.content.strip()
     logger.info(f"[Format] Answer generated successfully")
@@ -208,7 +217,10 @@ Rules:
 - Do not include SQL or markdown.
 
 Schema:
-{state['schema']}"""),
+{state['schema']}
+
+Recent conversation context:
+{state['conversation_context'] or 'No previous context.'}"""),
         HumanMessage(content=json.dumps({
             "question": state["question"],
             "columns": columns,
@@ -242,11 +254,12 @@ workflow.add_edge("format_answer", END)
 graph = workflow.compile()
 
 
-def run_agent(question: str, schema: str, conn):
+def run_agent(question: str, schema: str, conn, conversation_context: str = ""):
     logger.info(f"[Agent] Starting pipeline for: '{question}'")
     initial_state: AgentState = {
         "question": question,
         "schema": schema,
+        "conversation_context": conversation_context,
         "is_db_question": False,
         "sql": "",
         "query_result": "",

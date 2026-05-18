@@ -231,6 +231,21 @@ export default function App() {
     }));
   };
 
+  const getRecentHistory = (chatMessages) => {
+    const selected = [];
+    let userTurns = 0;
+
+    for (let i = chatMessages.length - 1; i >= 0; i -= 1) {
+      const msg = chatMessages[i];
+      if (!msg.content) continue;
+      selected.push({ role: msg.role, content: msg.content });
+      if (msg.role === 'user') userTurns += 1;
+      if (userTurns >= 3) break;
+    }
+
+    return selected.reverse();
+  };
+
   const handleSend = async () => {
     if (!input.trim() || loading) return;
     const question = input.trim();
@@ -239,7 +254,7 @@ export default function App() {
     updateMessages(updated);
     setLoading(true);
     try {
-      const res = await axios.post(`${API}/query`, { question });
+      const res = await axios.post(`${API}/query`, { question, history: getRecentHistory(messages) });
       updateMessages([...updated, { role: 'bot', content: res.data.answer, chart: res.data.chart }]);
     } catch (e) {
       updateMessages([...updated, { role: 'bot', content: 'Error: ' + (e.response?.data?.detail || e.message) }]);
