@@ -1,7 +1,10 @@
 import os
 import logging
 import re
-from typing import TypedDict, Annotated
+import json
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any, TypedDict, Annotated
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -21,6 +24,8 @@ class AgentState(TypedDict):
     query_result: str
     answer: str
     error: str
+    wants_visualization: bool
+    chart: dict[str, Any] | None
 
 
 QUERY_INTENT_TERMS = {
@@ -28,6 +33,11 @@ QUERY_INTENT_TERMS = {
     "min", "max", "top", "bottom", "highest", "lowest", "most", "least", "show",
     "list", "find", "filter", "compare", "group", "grouped", "by", "where", "spent",
     "amount", "revenue", "sales", "orders", "customers", "users", "transactions"
+}
+
+VISUALIZATION_TERMS = {
+    "visualize", "visualise", "visualization", "visualisation", "chart", "graph",
+    "plot", "draw", "show", "display", "bar", "line", "pie", "scatter"
 }
 
 SCHEMA_STOPWORDS = {
@@ -60,6 +70,38 @@ def _looks_db_related(question: str, schema: str) -> bool:
     if len(intent_matches) >= 2 and any(term in _schema_terms(schema) for term in {"amount", "spent", "state", "date", "gender", "age"}):
         return True
     return False
+
+
+def wants_visualization(question: str) -> bool:
+    question_terms = _tokens(question)
+    return bool(question_terms & VISUALIZATION_TERMS)
+
+
+def _json_safe(value):
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return value
+
+
+def _rows_to_records(cols, rows):
+    return [
+        {col: _json_safe(value) for col, value in zip(cols, row)}
+        for row in rows
+    ]
+
+
+def _extract_json_object(content: str) -> dict[str, Any]:
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r"```$", "", cleaned).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("LLM did not return a JSON object")
+    return json.loads(cleaned[start:end + 1])
 
 
 def classify_question(state: AgentState) -> AgentState:
@@ -129,6 +171,59 @@ def format_answer(state: AgentState) -> AgentState:
     return state
 
 
+def generate_chart(state: AgentState, records: list[dict[str, Any]], columns: list[str]) -> AgentState:
+    logger.info("[Visualize] Choosing chart type and building chart spec...")
+    response = get_llm().invoke([
+        SystemMessage(content=f"""You are a data visualization assistant for a business chatbot.
+Choose the best chart for the user's question and SQL result.
+
+Allowed chart types:
+- bar: comparing categories or rankings
+- line: trends over dates/time or ordered sequences
+- scatter: numeric relationships
+- pie: parts of a whole with a small number of categories
+
+Return ONLY valid JSON with this exact shape:
+{{
+  "type": "bar | line | scatter | pie",
+  "title": "short chart title",
+  "xLabel": "clear x-axis label",
+  "yLabel": "clear y-axis label",
+  "x": ["category/date values"],
+  "y": [number values],
+  "seriesName": "legend label",
+  "insight": "two concise sentences: first state the key finding with numbers, then explain the business implication"
+}}
+
+Rules:
+- Use the provided SQL result only.
+- Prefer bar charts for department/project/employee comparisons.
+- Prefer line charts for date/time trends.
+- Keep labels human readable.
+- If there are too many rows, use the most relevant top 12.
+- y must be numeric.
+- Write the insight as exactly two concise sentences.
+- The first sentence should describe the strongest finding using actual values from the chart.
+- The second sentence should explain what that means for a business user.
+- Do not include SQL or markdown.
+
+Schema:
+{state['schema']}"""),
+        HumanMessage(content=json.dumps({
+            "question": state["question"],
+            "columns": columns,
+            "rows": records[:50],
+        }, ensure_ascii=False))
+    ])
+    chart = _extract_json_object(response.content)
+    chart.setdefault("seriesName", "Value")
+    chart.setdefault("insight", "")
+    state["chart"] = chart
+    state["answer"] = chart.get("insight") or "Here is the visualization for your data."
+    logger.info(f"[Visualize] Chart generated: {chart.get('type')}")
+    return state
+
+
 def route_question(state: AgentState):
     return "generate_sql" if state["is_db_question"] else END
 
@@ -156,7 +251,9 @@ def run_agent(question: str, schema: str, conn):
         "sql": "",
         "query_result": "",
         "answer": "",
-        "error": ""
+        "error": "",
+        "wants_visualization": wants_visualization(question),
+        "chart": None
     }
 
     state = initial_state.copy()
@@ -179,6 +276,7 @@ def run_agent(question: str, schema: str, conn):
         cols = [desc[0] for desc in cur.description]
         rows = cur.fetchall()
         cur.close()
+        records = _rows_to_records(cols, rows)
         result_str = f"Columns: {cols}\nRows: {rows[:50]}"
         state["query_result"] = result_str
         logger.info(f"[Execute SQL] Success. Returned {len(rows)} rows")
@@ -187,7 +285,13 @@ def run_agent(question: str, schema: str, conn):
         logger.error(f"[Execute SQL] Failed: {str(e)}")
         return {"answer": f"SQL execution error: {str(e)}", "sql": state["sql"], "is_db_question": True, "error": True}
 
-    # Format answer
+    if state["wants_visualization"]:
+        if not rows:
+            return {"answer": "I could not build a chart because the query returned no rows.", "is_db_question": True}
+        state = generate_chart(state, records, cols)
+        logger.info("[Agent] Visualization pipeline complete")
+        return {"answer": state["answer"], "chart": state["chart"], "is_db_question": True}
+
     state = format_answer(state)
 
     logger.info("[Agent] Pipeline complete")

@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import axios from 'axios';
 import ReactMarkdown from 'react-markdown';
+import Plot from 'react-plotly.js';
 
 const API = 'http://localhost:8000';
 
@@ -25,6 +26,14 @@ const styles = {
   sendBtn: { background: '#CC0000', border: 'none', borderRadius: '8px', padding: '8px 16px', color: 'white', cursor: 'pointer', fontWeight: '600', fontSize: '14px' },
   msgUser: { background: '#2d2d2d', padding: '14px 18px', borderRadius: '12px', maxWidth: '768px', margin: '0 auto', width: '100%' },
   msgBot: { background: '#1a1a1a', padding: '14px 18px', borderRadius: '12px', maxWidth: '768px', margin: '0 auto', width: '100%', border: '1px solid #333' },
+  chartCard: { background: '#ffffff', color: '#172033', borderRadius: '10px', padding: '16px', marginTop: '10px', border: '1px solid #edf1f7', boxShadow: '0 14px 38px rgba(15, 23, 42, 0.07)' },
+  chartHeader: { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' },
+  chartIcon: { width: '24px', height: '24px', borderRadius: '7px', background: '#eef7f1', color: '#22a06b', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: '800', fontSize: '13px' },
+  chartTitle: { fontSize: '14px', fontWeight: '800', color: '#202938', marginBottom: '3px', letterSpacing: 0 },
+  chartType: { fontSize: '11px', color: '#8a94a6', fontWeight: '600' },
+  plotWrap: { background: '#ffffff', border: '1px solid #eef2f7', borderRadius: '9px', padding: '14px 12px 8px', overflowX: 'auto', overflowY: 'hidden' },
+  insightBox: { background: '#eef5ff', border: '1px solid #dfeaff', color: '#24509a', borderRadius: '8px', padding: '12px 14px', marginTop: '12px', fontSize: '12px', fontWeight: '700', lineHeight: 1.55 },
+  insightLabel: { color: '#f59e0b', fontSize: '13px', fontWeight: '900', marginRight: '8px' },
   statusDot: { width: '8px', height: '8px', borderRadius: '50%', display: 'inline-block' },
   chatItem: { padding: '10px 12px', borderRadius: '8px', cursor: 'pointer', fontSize: '13px', color: '#ccc', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', marginBottom: '4px' },
   chatItemActive: { background: '#2d2d2d' },
@@ -33,6 +42,111 @@ const styles = {
   profileBtn: { display: 'flex', alignItems: 'center', gap: '10px', padding: '12px', borderTop: '1px solid #2d2d2d', cursor: 'pointer', marginTop: 'auto' },
   overlay: { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 },
 };
+
+function ChartMessage({ chart }) {
+  if (!chart || !Array.isArray(chart.x) || !Array.isArray(chart.y)) return null;
+
+  const type = chart.type || 'bar';
+  const isPie = type === 'pie';
+  const chartWidth = isPie ? 680 : Math.max(680, chart.x.length * 105);
+  const palette = ['#4f75e8', '#5d8ff0', '#6aa6f8', '#7db7fb', '#9ac8ff', '#bddcff'];
+  const accentColor = '#f59e0b';
+  const trace = isPie
+    ? {
+        type: 'pie',
+        labels: chart.x,
+        values: chart.y,
+        hole: 0.45,
+        textinfo: 'label+percent',
+        marker: { colors: palette, line: { color: '#ffffff', width: 3 } },
+        hovertemplate: '%{label}<br>%{value}<br>%{percent}<extra></extra>',
+      }
+    : {
+        type: type === 'scatter' ? 'scatter' : type,
+        mode: type === 'line' || type === 'scatter' ? 'lines+markers' : undefined,
+        x: chart.x,
+        y: chart.y,
+        name: chart.seriesName || 'Value',
+        line: { color: accentColor, width: 2, shape: 'spline' },
+        marker: {
+          color: type === 'bar' ? chart.y.map((_, index) => palette[index % palette.length]) : accentColor,
+          size: 8,
+          line: { color: '#ffffff', width: 1.5 },
+        },
+        width: type === 'bar' ? 0.42 : undefined,
+        opacity: 0.95,
+        hovertemplate: `%{x}<br>${chart.yLabel || 'Value'}: %{y}<extra></extra>`,
+      };
+
+  const layout = {
+    autosize: true,
+    height: 350,
+    margin: { l: 72, r: 24, t: 34, b: 76 },
+    paper_bgcolor: '#ffffff',
+    plot_bgcolor: '#ffffff',
+    font: { family: 'Inter, Segoe UI, Arial, sans-serif', color: '#3f4a5f', size: 12 },
+    showlegend: true,
+    legend: { orientation: 'h', x: 0.5, xanchor: 'center', y: 1.16, font: { size: 12, color: '#273142' }, itemsizing: 'constant' },
+    hoverlabel: { bgcolor: '#111827', bordercolor: '#111827', font: { color: '#ffffff', family: 'Inter, Segoe UI, Arial, sans-serif' } },
+    bargap: 0.48,
+    xaxis: isPie ? undefined : {
+      title: { text: chart.xLabel || 'Category', standoff: 20, font: { size: 12, color: '#374151', family: 'Inter, Segoe UI, Arial, sans-serif', weight: 700 } },
+      gridcolor: '#f2f5f9',
+      tickangle: -35,
+      zeroline: false,
+      tickfont: { color: '#7b8496', size: 11 },
+      linecolor: '#e3e9f2',
+      mirror: false,
+    },
+    yaxis: isPie ? undefined : {
+      title: { text: chart.yLabel || 'Value', standoff: 20, font: { size: 12, color: '#374151', family: 'Inter, Segoe UI, Arial, sans-serif', weight: 700 } },
+      gridcolor: '#f2f5f9',
+      zerolinecolor: '#e3e9f2',
+      tickfont: { color: '#7b8496', size: 11 },
+      linecolor: '#e3e9f2',
+      rangemode: 'tozero',
+    },
+  };
+
+  return (
+    <div style={styles.chartCard}>
+      <div style={styles.chartHeader}>
+        <div style={styles.chartIcon}>▥</div>
+        <div>
+          <div style={styles.chartTitle}>{chart.title || 'Data Visualization'}</div>
+          <div style={styles.chartType}>{`${type.charAt(0).toUpperCase() + type.slice(1)} Chart`}</div>
+        </div>
+      </div>
+      <div style={styles.plotWrap}>
+        <Plot
+          data={[trace]}
+          layout={layout}
+          config={{
+            responsive: true,
+            displaylogo: false,
+            scrollZoom: true,
+            toImageButtonOptions: {
+              format: 'png',
+              filename: (chart.title || 'data-visualization').toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+              height: 720,
+              width: 1100,
+              scale: 2,
+            },
+            modeBarButtonsToRemove: ['lasso2d', 'select2d'],
+          }}
+          style={{ width: chartWidth }}
+          useResizeHandler
+        />
+      </div>
+      {chart.insight && (
+        <div style={styles.insightBox}>
+          <span style={styles.insightLabel}>•</span>
+          <span>{chart.insight}</span>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function ConnectForm({ onConnected, onClose }) {
   const [form, setForm] = useState({ host: '', port: '', username: '', password: '', database: '' });
@@ -126,7 +240,7 @@ export default function App() {
     setLoading(true);
     try {
       const res = await axios.post(`${API}/query`, { question });
-      updateMessages([...updated, { role: 'bot', content: res.data.answer }]);
+      updateMessages([...updated, { role: 'bot', content: res.data.answer, chart: res.data.chart }]);
     } catch (e) {
       updateMessages([...updated, { role: 'bot', content: 'Error: ' + (e.response?.data?.detail || e.message) }]);
     }
@@ -201,7 +315,8 @@ export default function App() {
               <div style={{ fontSize: '11px', color: '#888', marginBottom: '6px' }}>
                 {msg.role === 'user' ? 'You' : 'Honda Assistant'}
               </div>
-              <ReactMarkdown>{msg.content}</ReactMarkdown>
+              {!msg.chart && <ReactMarkdown>{msg.content}</ReactMarkdown>}
+              {msg.chart && <ChartMessage chart={msg.chart} />}
             </div>
           ))}
           {loading && (
