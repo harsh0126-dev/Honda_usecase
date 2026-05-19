@@ -25,13 +25,13 @@ app.add_middleware(
 # FIXED TABLE CONFIGURATION
 # -----------------------------
 
-FIXED_TABLES = ["Honda_Data"]
+FIXED_TABLES = ["honda_data"]
 
 FIXED_SCHEMA_CONTEXT = """
 Database Domain:
 Honda Manufacturing Production, Inventory, Quality, and Shipping Operations Analytics.
 
-Table Name: Honda_Data
+Table Name: honda_data
 
 Description:
 This table contains manufacturing production KPIs, inventory metrics,
@@ -39,12 +39,12 @@ quality indicators, shipping performance, downtime information,
 and operational recovery details for Honda manufacturing plants and production lines.
 
 ===========================================================
-TABLE: Honda_Data
+TABLE: honda_data
 ===========================================================
 
 Columns:
 
-1. Plant (Text)
+1. Plant (varchar)
 Description:
 Represents the manufacturing plant code or facility where the units/products are produced.
 Different plant codes help identify production locations and compare operational performance across manufacturing sites.
@@ -59,7 +59,7 @@ Sample Values:
 
 -----------------------------------------------------------
 
-2. Line (Text)
+2. Line (varchar)
 Description:
 Refers to the production line code within a plant.
 Each line may perform a specific manufacturing activity such as welding,
@@ -72,7 +72,7 @@ Sample Values:
 
 -----------------------------------------------------------
 
-3. Date (Timestamp)
+3. Date (date)
 Description:
 Indicates the production date on which the manufacturing activity
 or unit production was recorded.
@@ -146,7 +146,7 @@ typically month-to-date.
 
 -----------------------------------------------------------
 
-13. Coretimeachieved (text)
+13. Coretimeachieved (varchar)
 Description:
 Indicates whether the planned production target was achieved
 within the standard production time.
@@ -157,7 +157,7 @@ Typical Values:
 
 -----------------------------------------------------------
 
-14. "CTA(Monthtodate)" (text)
+14. "CTA(Monthtodate)" (varchar)
 Description:
 Month-to-date count of how many times the Core Time target
 was achieved versus missed.
